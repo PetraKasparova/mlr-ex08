@@ -142,14 +142,15 @@ function showDiagnostics(lines, forceOpen) {
   $('diagText').textContent = lines.join('\n');
 }
 
-/* Fetch one resource and return a one-line description of the result.
-   A failed fetch is the #1 cause of "Failed to fetch" — name the URL and status. */
+/* Reachability check for one resource, as one line of diagnostics.
+   Uses HEAD on purpose: a ranged GET makes GitHub Pages answer with a cacheable
+   206 fragment that can poison the browser's later wasm module import. */
 async function probe(url) {
   const full = new URL(url, location.href).href;
   try {
-    const r = await fetch(url, { method: 'GET', headers: { Range: 'bytes=0-0' } });
-    return { ok: r.status === 200 || r.status === 206,
-             line: `${r.status === 200 || r.status === 206 ? 'ok  ' : 'FAIL'} HTTP ${r.status}  ${full}` };
+    const r = await fetch(url, { method: 'HEAD' });
+    const ok = (r.status >= 200 && r.status < 400) || r.status === 405;
+    return { ok, line: `${ok ? 'ok  ' : 'FAIL'} HTTP ${r.status}  ${full}` };
   } catch (e) {
     return { ok: false, line: `FAIL network (${e.name}: ${e.message})  ${full}` };
   }
