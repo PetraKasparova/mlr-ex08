@@ -48,6 +48,8 @@
   #selftest td { padding: 2px 6px; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
   #selftest .pass { color: var(--accent); font-weight: 700; }
   #selftest .fail { color: #b3261e; font-weight: 700; }
+  details.diag { font-size: .8rem; color: var(--muted); margin: 8px 0; }
+  details.diag pre { white-space: pre-wrap; word-break: break-all; margin: 6px 0; }
   footer.share {
     display: flex; gap: 14px; align-items: center; margin-top: 22px;
     border-top: 2px solid var(--line); padding-top: 14px;
@@ -71,8 +73,14 @@
 <div class="controls">
   <button id="startBtn" disabled>▶ Start rear camera</button>
   <button id="stopBtn" class="secondary" hidden>■ Stop camera</button>
+  <button id="retryBtn" class="secondary" hidden>↻ Retry loading</button>
   <label class="filebtn">📷 Upload photo<input type="file" id="fileInput" accept="image/*"></label>
 </div>
+
+<details class="diag" id="diag" hidden>
+  <summary>Load diagnostics</summary>
+  <pre id="diagText"></pre>
+</details>
 
 <section class="card" aria-label="Class probabilities">
   <div id="results"><!-- bars injected by JS --></div>
@@ -92,7 +100,8 @@
   </div>
 </footer>
 
-<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.21.0/dist/ort.min.js"></script>
+<!-- ONNX Runtime Web 1.21.0 (MIT) served from the same origin, see vendor/ and README.md -->
+<script src="vendor/ort.min.js" onerror="window.__ortScriptFailed = true"></script>
 <script src="qrcode-generator.js"></script>
 <script>
 'use strict';
@@ -103,6 +112,11 @@ const PAGE_URL = 'https://petrakasparova.github.io/mlr-ex08/';
 /* Fallback copy of model_info.json (the page fetches model_info.json and prefers it). */
 const DEFAULTS = { classes: ['apple', 'cherry', 'chestnut', 'maple'], input_size: 96,
                    mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225] };
+
+const MODEL_URL = 'leaf_model.onnx';
+const WASM_DIR  = 'vendor/';                      // same-origin onnxruntime-web assets
+const WASM_FILES = ['vendor/ort.min.js', 'vendor/ort-wasm-simd-threaded.jsep.mjs',
+                    'vendor/ort-wasm-simd-threaded.jsep.wasm'];
 
 let CFG = { ...DEFAULTS };
 let session = null;          // InferenceSession
@@ -120,6 +134,40 @@ function setStatus(msg, isError = false) {
   statusEl.classList.toggle('error', isError);
 }
 
+let diagLines = [];
+function showDiagnostics(lines, forceOpen) {
+  diagLines = lines;
+  $('diag').hidden = false;
+  if (forceOpen) $('diag').open = true;
+  $('diagText').textContent = lines.join('\n');
+}
+
+/* Fetch one resource and return a one-line description of the result.
+   A failed fetch is the #1 cause of "Failed to fetch" — name the URL and status. */
+async function probe(url) {
+  const full = new URL(url, location.href).href;
+  try {
+    const r = await fetch(url, { method: 'GET', headers: { Range: 'bytes=0-0' } });
+    return { ok: r.status === 200 || r.status === 206,
+             line: `${r.status === 200 || r.status === 206 ? 'ok  ' : 'FAIL'} HTTP ${r.status}  ${full}` };
+  } catch (e) {
+    return { ok: false, line: `FAIL network (${e.name}: ${e.message})  ${full}` };
+  }
+}
+
+function webAssemblyInfo() {
+  const out = ['WebAssembly: ' + (typeof WebAssembly === 'object' ? 'present' : 'MISSING')];
+  if (typeof WebAssembly !== 'object') return out;
+  // minimal wasm module whose function uses i8x16.splat — true only where SIMD is supported
+  const simdProbe = new Uint8Array([0,97,115,109,1,0,0,0,1,5,1,96,0,1,123,
+                                    3,2,1,0,10,8,1,6,0,65,0,253,15,11]);
+  let simd = false;
+  try { simd = WebAssembly.validate(simdProbe); } catch (e) { /* stays false */ }
+  out.push('WASM SIMD: ' + (simd ? 'supported' : 'NOT supported — this browser cannot run the model'));
+  out.push('crossOriginIsolated: ' + self.crossOriginIsolated + ' (runtime runs single-threaded, none needed)');
+  return out;
+}
+
 /* ---------- model ---------- */
 
 async function loadConfig() {
@@ -132,9 +180,34 @@ async function loadConfig() {
 }
 
 async function loadModel() {
-  ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.21.0/dist/';
-  ort.env.wasm.numThreads = 1;   // GitHub Pages is not crossOriginIsolated → single-threaded WASM
-  session = await ort.InferenceSession.create('leaf_model.onnx', { executionProviders: ['wasm'] });
+  if (window.__ortScriptFailed || typeof ort === 'undefined') {
+    throw new Error('onnxruntime-web script failed to load from ' +
+                    new URL(WASM_DIR + 'ort.min.js', location.href).href +
+                    ' — check that file in "Load diagnostics" below.');
+  }
+  const simd = webAssemblyInfo();
+  if (simd.some(l => l.includes('NOT supported') || l.includes('MISSING'))) {
+    throw new Error(simd.find(l => l.includes('NOT supported') || l.includes('MISSING')));
+  }
+  // absolute URL: ORT feeds wasmPaths into a dynamic import(), which rejects bare paths
+  ort.env.wasm.wasmPaths = new URL(WASM_DIR, location.href).href;   // same-origin, no external CDN
+  ort.env.wasm.numThreads = 1;          // GitHub Pages is not crossOriginIsolated
+  ort.env.logLevel = 'warning';
+
+  // Pre-flight: report exactly which asset is unreachable instead of a bare "Failed to fetch".
+  const probes = [];
+  for (const u of [MODEL_URL, ...WASM_FILES]) probes.push(await probe(u));
+  showDiagnostics([`page: ${location.href}`,
+                   `onnxruntime-web ${ort.version ?? ''}`,
+                   ...webAssemblyInfo(),
+                   ...probes.map(p => p.line)]);
+  const bad = probes.find(p => !p.ok);
+  if (bad) throw new Error('Required file not reachable: ' + bad.line);
+
+  session = await ort.InferenceSession.create(MODEL_URL, {
+    executionProviders: ['wasm'],
+    graphOptimizationLevel: 'all',
+  });
 }
 
 /* ---------- preprocessing (per model_info.json) ----------
@@ -228,9 +301,9 @@ async function startCamera() {
       audio: false,
     });
   } catch (e) {
-    const why = e.name === 'NotAllowedError' ? 'Camera permission denied — allow it in Safari settings, or use “Upload photo”.'
+    const why = e.name === 'NotAllowedError' ? 'Camera permission denied — allow it in Safari/Chrome settings, or use “Upload photo”.'
               : e.name === 'NotFoundError'   ? 'No camera found — use “Upload photo”.'
-              : 'Camera unavailable (' + e.name + ') — use “Upload photo”.';
+              : 'Camera unavailable (' + e.name + ': ' + e.message + ') — use “Upload photo”.';
     setStatus(why, true);
     return;
   }
@@ -257,8 +330,9 @@ function stopCamera() {
 async function onFile(ev) {
   const file = ev.target.files && ev.target.files[0];
   if (!file) return;
+  if (!session) { setStatus('The model is not loaded yet — fix the load error above (see “Load diagnostics”) or press ↻ Retry.', true); ev.target.value = ''; return; }
   if (looping) stopCamera();
-  setStatus('Classifying ' + (file.name || 'photo') + '…');
+  setStatus('Classifying ' + (file.name || 'photo') + ' locally in this browser…');
   let source;
   try {
     if (self.createImageBitmap) {
@@ -290,7 +364,7 @@ function buildQr() {
   link.textContent = PAGE_URL;
 }
 
-/* ---------- self-test: append ?selftest=1 to check_image.jpg ---------- */
+/* ---------- self-test: append ?selftest=1 to check check_image.jpg ---------- */
 
 async function runSelfTest() {
   const box = $('selftest');
@@ -322,22 +396,30 @@ async function runSelfTest() {
 
 /* ---------- boot ---------- */
 
-(async function main() {
-  buildQr();
-  $('startBtn').addEventListener('click', startCamera);
-  $('stopBtn').addEventListener('click', stopCamera);
-  $('fileInput').addEventListener('change', onFile);
+async function boot() {
+  $('retryBtn').hidden = true;
   try {
     await loadConfig();
     buildBars();
     await loadModel();
     $('startBtn').disabled = false;
-    setStatus('Model ready. Start the rear camera or upload a photo.');
+    setStatus('Model ready. Start the rear camera or upload a photo — everything runs locally in this browser.');
     if (new URLSearchParams(location.search).has('selftest')) await runSelfTest();
   } catch (e) {
-    setStatus('Could not load the model: ' + e.message + ' (need a browser with WebAssembly SIMD, e.g. iOS Safari 16.4+).', true);
+    setStatus('Could not load the model — ' + e.message, true);
+    $('retryBtn').hidden = false;
+    if (new URLSearchParams(location.search).has('selftest')) {
+      window.__selftest = { done: true, pass: false, error: e.message };
+    }
   }
-})();
+}
+
+buildQr();
+$('startBtn').addEventListener('click', startCamera);
+$('stopBtn').addEventListener('click', stopCamera);
+$('fileInput').addEventListener('change', onFile);
+$('retryBtn').addEventListener('click', boot);
+boot();
 </script>
 </body>
 </html>
