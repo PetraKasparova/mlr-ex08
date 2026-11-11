@@ -24,10 +24,12 @@
     background: #eaf2e6; border: 1px solid var(--line);
   }
   #status.error { background: #fdecec; border-color: #f2b8b8; color: #8a1f1f; }
-  video {
+  video, #still {
     width: 100%; aspect-ratio: 4 / 3; background: #000; border-radius: 12px;
-    object-fit: cover; display: block;
+    display: block;
   }
+  video { object-fit: cover; }
+  #still { object-fit: contain; }   /* uploaded photo keeps its aspect ratio (letterboxed) */
   .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 12px 0; }
   button, .filebtn {
     font: inherit; font-weight: 600; color: #fff; background: var(--accent);
@@ -69,6 +71,7 @@
 <p id="status">Loading the model…</p>
 
 <video id="video" playsinline muted autoplay></video>
+<img id="still" alt="Uploaded photo" hidden>
 
 <div class="controls">
   <button id="startBtn" disabled>▶ Start rear camera</button>
@@ -126,6 +129,20 @@ let busy = false;            // one inference at a time
 
 const $ = (id) => document.getElementById(id);
 const video = $('video'), statusEl = $('status');
+const still = $('still');
+let stillUrl = null;                                  // object URL of the displayed photo
+
+function showPhoto(url) {                             // uploaded photo in the preview box
+  if (stillUrl) URL.revokeObjectURL(stillUrl);
+  stillUrl = url;
+  still.src = url;
+  still.hidden = false;
+  video.hidden = true;
+}
+function showCamera() {                               // live camera in the preview box
+  still.hidden = true;
+  video.hidden = false;
+}
 const capture = document.createElement('canvas');
 const cctx = capture.getContext('2d', { willReadFrequently: true });
 
@@ -310,6 +327,7 @@ async function startCamera() {
   }
   video.srcObject = stream;
   await video.play().catch(() => {});
+  showCamera();
   looping = true;
   $('startBtn').hidden = true;
   $('stopBtn').hidden = false;
@@ -321,6 +339,7 @@ function stopCamera() {
   looping = false;
   if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
   video.srcObject = null;
+  if (stillUrl) { still.hidden = false; video.hidden = true; }   // back to the last photo, not black
   $('startBtn').hidden = false;
   $('stopBtn').hidden = true;
   setStatus('Camera stopped — you can still “Upload photo”.');
@@ -348,6 +367,7 @@ async function onFile(ev) {
     ev.target.value = '';
     return;
   }
+  showPhoto(URL.createObjectURL(file));         // show the picked photo while classifying
   await classifyOnce(source, 'Result for ' + (file.name || 'photo') + ' — tap “Start rear camera” to go live again.');
   if (source.close) source.close();
   ev.target.value = '';
