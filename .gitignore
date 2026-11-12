@@ -1,3 +1,4 @@
 _scratch/
-REVIEW.md
-REPORT.md
+data/
+task4/output/
+__pycache__/
